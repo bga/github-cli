@@ -1,0 +1,1095 @@
+#!/bin/bash
+# [https://github.com/grogorick/github-cli]
+set -eu
+
+# config ----------
+
+github_user=""
+github_user_envvar=GITHUB_USER
+github_user_filename=github-user.txt
+
+github_token=""
+github_token_envvar=GITHUB_API_TOKEN
+github_token_filename=github-api-token.txt
+
+github_server="" # https://github.com
+github_server_envvar=GITHUB_SERVER_URL
+github_server_filename=github-server-url.txt
+
+
+curlExtraOptions="" # --insecure
+curlExtraOptions_envvar=GITHUB_CURL_EXTRA_OPTIONS
+
+# utils ----------
+
+shopt -s expand_aliases
+
+debug=
+
+function configure() {
+	# server url
+	github_server=$(printenv $github_server_envvar) || true
+	if [ -z "$github_server" ] && [ -f "$github_server_filename" ]; then
+		github_server=$(cat "$github_server_filename")
+  fi
+	if [ -z "$github_server" ] && [ $# -eq 0 ]; then
+		echo-warning No Github server URL \(e.g. https://github.com\) configured.
+		read -rp "URL: " github_server
+		echo
+		if [ -z "$github_server" ]; then exit 0; fi
+	fi
+	# normalize url
+	github_server=${github_server/#http:\/\//}
+	github_server=${github_server/#https:\/\//}
+	github_server=${github_server/%\//}
+	# github_server=${github_server/#github.com\//}
+
+	# github user
+	github_user=$(printenv $github_user_envvar) || true
+	if [ -z "$github_user" ] && [ -f "$github_user_filename" ]; then
+		github_user=$(cat "$github_user_filename")
+  fi
+	if [ -z "$github_user" ] && [ $# -eq 0 ]; then
+		echo-warning No Github user \(e.g. user\) configured.
+		read -rp "User: " github_user
+		echo
+		if [ -z "$github_user" ]; then exit 0; fi
+	fi
+
+	# api token
+	github_token=$(printenv $github_token_envvar) || true
+	if [ -z "$github_token" ] && [ -f "$github_token_filename" ]; then
+		github_token=$(cat "$github_token_filename")
+	fi
+  if [ -z "$github_token" ] && [ -f "$github_token_filename.gpg" ]; then
+		github_token=$(gpg -q -d "$github_token_filename.gpg" 2>/dev/null)
+	fi
+  if [ -z "$github_token" ] && [ $# -eq 0 ]; then
+		echo-warning No Github API token configured.
+		read -rsp "Token: " github_token
+		echo
+		if [ -z "$github_token" ]; then exit 0; fi
+	fi
+
+	# curlExtraOptions
+	curlExtraOptions=$(printenv $curlExtraOptions_envvar || echo)
+}
+
+function run_curl_and_log() {
+	# if is-debug; then
+	if true; then
+		echo "$@" > log_curl_cmd.txt
+		output=$("$@" 2> log_error.txt)
+		echo "$output" > log_curl_response.txt
+		echo -n "$output"
+	else
+		"$@" 2> /dev/null
+	fi
+}
+
+function github-curl() {
+	method=$1
+	# auth="?token=$github_token"
+	auth=-H\ "Authorization: token $github_token"
+	auth=(-H "Authorization: Bearer $github_token")
+	cmd=$2
+	data=
+	if [[ 3 -le "$#" ]]; then data=$3; fi
+	address=https://api.$github_server$cmd
+
+	if is-debug; then
+		echo \#
+		echo -e "# Method:  $method"
+		echo -e "# Command: $cmd"
+		echo -e "# Address: $address"
+		echo -e "# Data:    $data"
+	fi
+	if ! [ -n "$dry_run" ]; then
+		echo
+		sleep 1s
+		if [ -n "$data" ]; then
+			run_curl_and_log curl -d "$data" "${auth[@]}" -H "Content-Type: application/json" -X "$method" "$address" $curlExtraOptions
+		else
+			run_curl_and_log curl "${auth[@]}" -X "$method" "$address" $curlExtraOptions
+		fi
+	fi
+}
+
+function github-curl-basic() {
+	method=$1
+	auth=$2
+	cmd=$3
+	data="$4"
+	address=https://api.$github_server$cmd
+
+	if is-debug; then
+		echo \#
+		echo -e "# Method:  $method"
+		echo -e "# Auth:    $auth"
+		echo -e "# Command: $cmd"
+		echo -e "# Address: $address"
+		echo -e "# Data:    $data"
+	fi
+	if ! [ -n "$dry_run" ]; then
+		echo
+		sleep 1s
+		if [ -n "$data" ]; then
+			run_curl_and_log curl -u "$auth" -d "$data" -H "Content-Type: application/json" -X "$method" "$address" $curlExtraOptions
+		else
+			run_curl_and_log curl -u "$auth" -X "$method" "$address" $curlExtraOptions
+		fi
+	fi
+}
+
+function syntax-help() {
+	if [ "$1" -gt $(( $# - 2 )) ]; then local missing_args=true; else local missing_args=; fi
+	if [ -n "$help" ]; then local help_requested=true; else local help_requested=; fi
+	if [ -n "$missing_args" ] || [ -n "$help_requested" ]; then
+		if ! [[ 2 -le "$#" ]]; then
+			echo Syntax: \(no arguments\)
+		else
+			if ! [ -n "$help_requested" ]; then
+				echo-error Missing argument\(s\)
+			fi
+			echo Syntax: "$2"
+		fi
+		exit 1
+	fi
+}
+
+function echo-error() {
+	echo-colored 31 "$@"
+}
+function echo-warning() {
+	echo-colored 33 "$@"
+}
+function echo-success() {
+	echo-colored 32 "$@"
+}
+function echo-hint() {
+	echo-colored 90 "$@"
+}
+function echo-colored() {
+	local color=$1
+	shift
+
+	if [ "$1" = "-if" ]; then
+		condition=$2
+		shift; shift
+		if [ "$condition" -ne 0 ]; then
+			echo "$@"
+			return
+		fi
+	fi
+
+	if [ "$1" = "-if-error" ]; then
+		condition=$2
+		shift; shift
+		if [ "$condition" -eq 0 ]; then
+			echo "$@"
+			return
+		fi
+	fi
+
+	echo_cmd="echo -e"
+	while [ 0 -lt "$#" ]; do
+		if ! [[ "$1" = "-"* ]]; then break; fi
+		echo_cmd="$echo_cmd $1"
+		shift
+	done
+	$(echo "$echo_cmd") "\033[0;${color}m$@\033[0m"
+}
+
+function split-json() {
+	if [ $# -gt 2 ]; then
+		echo "$3"
+	else
+		cat
+	fi | sed "s/$1$2/$1\n$2/g"
+}
+
+function json-property() {
+	if [ $# -gt 1 ]; then
+		echo "$2"
+	else
+		cat
+	fi | sed "0,/\"$1\"/{s/\"$1\"/@@@/}" | sed -nE "s/^.*@@@:(\
+(true)|\
+(false)|\
+([0-9]+)|\
+\"([^\"]*)\"|\
+(\[[^]]*\])|\
+(\
+\{[^{}]*(\
+\{[^{}]*(\
+\{[^{}]*\}[^{}]*\
+)*\}[^{}]*\
+)*\}\
+)\
+).*$/\2\3\4\5\6\7/p"
+}
+
+function json-properties() {
+	json="$(</dev/stdin)"
+	for i in $(seq 1 $#); do
+		echo -n "$json" | json-property "${!i}"
+		echo -n " "
+	done
+	echo
+}
+
+function per-line() {
+	cat | while IFS='' read -r line; do
+		echo "$line" | $1
+	done
+}
+
+function is-number() {
+	case $1 in
+		''|*[!0-9]*) return 1;;
+	esac;
+}
+function is-not-number() {
+	case $1 in
+		''|*[!0-9]*) return 0;;
+	esac;
+	return 1
+}
+
+function sub-cmd() {
+	if is-debug; then
+		echo "#         \_ $1"
+	fi
+}
+function sub-cmd-no-debug() {
+	sub-cmd "$@"
+	if [ $debug -gt 0 ]; then
+		((debug++))
+	fi
+}
+alias sub-cmd-error-check='
+	echo-if-error "$response"; return-exit-code-if-error
+	if [ $debug -gt 0 ]; then
+		((debug--))
+	fi
+	'
+alias sub-cmd-cleanup='
+	if [ $debug -gt 0 ]; then
+		((debug--))
+	fi
+	'
+
+alias sub-cmd-skip-if-debug='
+	if [ -n "$dry_run" ]; then
+		((debug--))
+		return 0
+	fi
+	'
+function is-debug() {
+	if [ $debug -eq 1 ]; then
+		return 0
+	fi
+	return 1
+}
+
+# sanity checks ----------
+
+alias return-if-error='
+	if [ $? -ne 0 ]; then
+		return 0
+	fi
+	'
+alias return-exit-code-if-error='
+	local return_exit_code_if_error_code=$?
+	if [ $return_exit_code_if_error_code -ne 0 ]; then
+		return $return_exit_code_if_error_code
+	fi
+	'
+
+function check-entity() {
+	if [ -n "$no_checks" ]; then
+		return 0
+	fi
+	local not=$1
+	local entity=$2
+	local check=$3
+	local desc=$4
+	shift; shift; shift; shift
+	sub-cmd-no-debug "get-$entity (check-$check-exists$(if $not; then echo -not; fi))"
+	sub-cmd-skip-if-debug
+	$(echo get-"$entity") "$@" > /dev/null 2>&1
+	local check_entity_error_code=$?
+	sub-cmd-cleanup
+	if ! [ -n "$not" ] && [ $check_entity_error_code -eq 0 ]; then
+		echo-error "$desc" already exists
+		return 1
+	elif [ -n "$not" ] && [ $check_entity_error_code -ne 0 ]; then
+		echo-error "$desc" does NOT exist
+		return 1
+	fi
+	return 0
+}
+
+function check-entity-exists() { check-entity "" "$@"; }
+function check-entity-exists-not() { check-entity true "$@"; }
+
+function check-org-exists() { check-entity-exists org org "Organization \`$1\`" "$1"; }
+function check-org-exists-not() { check-entity-exists-not org org "Organization \`$1\`" "$1"; }
+
+function check-user-exists() { check-entity-exists user user "User \`$1\`" "$1"; }
+function check-user-exists-not() { check-entity-exists-not user user "User \`$1\`" "$1"; }
+
+function check-user-org-exists() { check-entity-exists user user-org "User/Organization \`$1\`" "$1"; }
+function check-user-org-exists-not() { check-entity-exists-not user user-org "User/Organization \`$1\`" "$1"; }
+
+function check-repo-exists() { check-entity-exists repo repo "Repository \`$1/$2\`" "$1" "$2"; }
+function check-repo-exists-not() { check-entity-exists-not repo repo "Repository \`$1/$2\`" "$1" "$2"; }
+
+function check-team-exists() { check-entity-exists team team "Team \`$1:$2\`" "$1" "$2"; }
+function check-team-exists-not() { check-entity-exists-not team team "Team \`$1:$2\`" "$1" "$2"; }
+
+function echo-and-exit-code--error-if-empty() {
+	if [ -n "$1" ]; then
+		echo "$1"
+		return 0
+	fi
+	return 1
+}
+
+function check-message() {
+	local message=$(echo "$1" | json-property message)
+	if [ -n "$message" ]; then
+		echo-error "$message"
+		return 1
+	fi
+	return 0
+}
+function echo-and-exit-code--error-if-message() {
+	if [ -n "$1" ]; then
+		check-message "$1"
+		return-exit-code-if-error
+		echo "$1"
+	fi
+	return 0
+}
+
+function echo-if-not() {
+	if [ "$1" -ne 0 ]; then
+		echo-error "$2"
+	fi
+	return "$1"
+}
+
+alias echo-if-error='echo-if-not $?'
+
+# specialized helpers ----------
+
+function resolve-team-id-and-following-name() {
+	if is-number "$1"; then
+		id=$1
+		name=$2
+	elif ! [[ 3 -le "$#" ]]; then
+		echo-error "The provided \`team-id\` is not a number"
+		return 1
+	else
+		check-org-exists-not "$1"; return-exit-code-if-error
+
+		sub-cmd-no-debug "get-teams id (resolve-team-id-and-following-name)"
+		response=$(get-team "$1" "$2" id)
+		sub-cmd-error-check
+
+		id=$response
+		name=$3
+	fi
+	return 0
+}
+
+function resolve-user-org-id() {
+	if is-number "$1"; then
+		echo "$1"
+	else
+		check-user-org-exists-not "$1"; return-exit-code-if-error
+
+		sub-cmd-no-debug "get-user id (resolve-user-org-id)"
+		response=$(get-user "$1" id)
+		sub-cmd-error-check
+
+		echo "$response"
+	fi
+	return 0
+}
+
+function resolve-or-input-password() {
+	if [ -n "$dry_run" ]; then
+		password=PASSWORD
+	elif [ -z "$1" ]; then
+		read -rsp "Password: " password
+		echo
+	else
+		password="$1"
+	fi
+}
+
+# actions ----------
+actions=
+
+# actions=$actions" create-api-token"
+function create-api-token() {
+	syntax-help 2 "user-name token-name [password]" "$@"
+
+	check-user-exists-not "$1"; return-exit-code-if-error
+
+	resolve-or-input-password "$3"
+
+	response=$(github-curl-basic POST "$1:$password" /users/"$1"/tokens "{\"name\":\"$2\"}")
+
+	if [ -z "$response" ]; then
+		echo-error Token could NOT be created. Wrong password?
+		return 1
+	elif is-debug; then
+		echo "$response"
+	else
+		echo "$response" | json-property sha1
+	fi
+}
+
+# actions=$actions" list-api-tokens"
+function list-api-tokens() {
+	syntax-help 1 "user-name [password]" "$@"
+
+	check-user-exists-not "$1"; return-exit-code-if-error
+
+	resolve-or-input-password "$2"
+
+	response=$(github-curl-basic GET "$1:$password" /users/"$1"/tokens)
+
+	check-message "$response"; return-exit-code-if-error
+
+	if is-debug; then
+		echo "$response"
+	else
+		echo "$response" | split-json "}," "{" | per-line "json-properties sha1 name"
+	fi
+}
+
+# actions=$actions" get-api-token-user"
+function get-api-token-user() {
+	syntax-help 0 "[property]" "$@"
+
+	response=$(github-curl GET /user)
+
+	if ! [[ 1 -le "$#" ]] || is-debug; then
+		output="$response"
+	else
+		output=$(echo "$response" | json-property "$1")
+	fi
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+actions=$actions" -"
+
+# actions=$actions" (admin) create-user"
+function create-user() {
+	syntax-help 3 "user-name email password" "$@"
+
+	check-user-exists "$1"; return-if-error
+
+	output=$(github-curl POST /admin/users "{\"username\":\"$1\",\"email\":\"$2\",\"password\":\"$3\"}")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+# actions=$actions" get-user"
+function get-user() {
+	syntax-help 1 "user-name [property]" "$@"
+
+	response=$(github-curl GET /users/"$1")
+
+	if [ -z "$response" ]; then
+		echo-error User \`"$1"\` does NOT exist
+		return 1
+	elif ! [[ 2 -le "$#" ]] || is-debug; then
+		output="$response"
+	else
+		output=$(echo "$response" | json-property "$2")
+	fi
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+# actions=$actions" (admin) delete-user"
+function delete-user() {
+	syntax-help 1 "user-name" "$@"
+
+	check-user-exists-not "$1"; return-if-error
+
+	output=$(github-curl DELETE /admin/users/"$1")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" -"
+
+# actions=$actions" create-own-org"
+function create-own-org() {
+	syntax-help 1 "org-name" "$@"
+
+	check-org-exists "$1"; return-if-error
+
+	output=$(github-curl POST /user/orgs "{\"username\":\"$1\"}")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" create-org"
+function create-org() {
+	syntax-help 1 "org-name" "$@"
+
+	check-org-exists "$1"; return-if-error
+
+	output=$(github-curl POST /orgs/$1)
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" list-orgs"
+function get-list-orgs() {
+	syntax-help 0 "$@"
+
+	output=$(github-curl POST /organizations)
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+# actions=$actions" (admin) create-org"
+function create-org() {
+	syntax-help 2 "org-name owner-user-name" "$@"
+
+	check-org-exists "$1"; return-if-error
+	check-user-exists-not "$2"; return-exit-code-if-error
+
+	output=$(github-curl POST /admin/users/"$2"/orgs "{\"username\":\"$1\"}")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" get-org"
+function get-org() {
+	syntax-help 1 "org-name [property]" "$@"
+
+	response=$(github-curl GET /orgs/"$1")
+
+	if [ -z "$response" ]; then
+		echo-error Organization \`"$1"\` does NOT exist
+		return 1
+	elif ! [[ 2 -le "$#" ]] || is-debug; then
+		output="$response"
+	else
+		output=$(echo "$response" | json-property "$2")
+	fi
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+actions=$actions" delete-org"
+function delete-org() {
+	syntax-help 1 "org-name" "$@"
+
+	check-org-exists "$1"; return-if-error
+
+	output=$(github-curl DELETE /orgs/$1)
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+
+actions=$actions" -"
+
+actions=$actions" create-own-repo"
+function create-own-repo() {
+	syntax-help 3 "repo-name description private:true/false" "$@"
+
+	check-repo-exists "$1" "$2"; return-if-error
+
+	# output=$(github-curl POST /user/repos "{\"name\":\"$1\",\"description\":\"$2\",\"private\":$3}")
+	output=$(github-curl POST /user/repos "{\"name\":\"$1\",\"description\":\"$2\",\"private\":$3,\"auto_init\":false,\"gitignore_template\":\"\"}")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" create-org-repo"
+function create-org-repo() {
+	syntax-help 4 "org-name repo-name description private:true/false" "$@"
+
+	check-org-exists-not "$1"; return-exit-code-if-error
+	check-repo-exists "$1" "$2"; return-if-error
+
+	output=$(github-curl POST /org/"$1"/repos "{\"name\":\"$1\",\"description\":\"$2\",\"private\":$3,\"auto_init\":false,\"gitignore_template\":\"\"}")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" (admin) create-repo"
+function create-repo() {
+	syntax-help 4 "user/org-name repo-name description private:true/false" "$@"
+
+	check-user-org-exists-not "$1"; return-exit-code-if-error
+	check-repo-exists "$1" "$2"; return-if-error
+
+	output=$(github-curl POST /admin/users/"$1"/repos "{\"name\":\"$2\",\"description\":\"$3\",\"private\":$4}")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" fork-repo"
+function fork-repo() {
+	# syntax-help 1 "clone-url [org] (owner-user/org-name | -id) private:true/false description" "$@"
+	syntax-help 1 "clone-url [org] (owner-user/org-name | -id)" "$@"
+
+	repo_url_path=$1
+	repo_url_path=${repo_url_path/#http:\/\//}
+	repo_url_path=${repo_url_path/#https:\/\//}
+	repo_url_path=${repo_url_path/#github.com\//}
+	repo_url_path=${repo_url_path/%\//}
+
+	to_organization_json=
+	if [[ -v 2 ]]; then
+		to_organization_json="{\"organization\": \"$2\"}"
+	fi
+
+	output=$(github-curl POST /repos/${repo_url_path}/forks "$to_organization_json")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+# actions=$actions" create-mirror-repo"
+function create-mirror() {
+	syntax-help 6 "clone-url repo-name (owner-user/org-name | -id) private:true/false mirror:true/false description [user-name password]" "$@"
+
+	owner=$(resolve-user-org-id "$3")
+
+	request="\"clone_addr\":\"$1\",\"repo_name\":\"$2\",\"uid\":$owner,\"private\":$4,\"mirror\":$5,\"description\":\"$6\""
+	if [[ 7 -le "$#" ]]; then
+		request="$request,\"auth_username\":\"$7\",\"auth_password\":\"$8\""
+	fi
+
+	output=$(github-curl POST /repos/migrate {"$request"})
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" list-own-repos"
+function list-own-repos() {
+	syntax-help 0 "" "$@"
+
+	response=$(github-curl GET /user/repos)
+
+	if is-debug; then
+		echo "$response"
+	else
+		echo "$response" | split-json "}}," "{" | per-line "json-property name"
+	fi
+}
+
+actions=$actions" list-org-repos"
+function list-org-repos() {
+	syntax-help 1 "org-name" "$@"
+
+	check-org-exists-not "$1"; return-exit-code-if-error
+
+	response=$(github-curl GET /orgs/"$1"/repos)
+
+	if is-debug; then
+		echo "$response"
+	else
+		echo "$response" | split-json "}}," "{" | per-line "json-property name"
+	fi
+}
+
+actions=$actions" list-user-repos"
+function list-user-repos() {
+	syntax-help 1 "user-name" "$@"
+
+	check-user-exists-not "$1"; return-exit-code-if-error
+
+	response=$(github-curl GET /users/"$1"/repos)
+
+	if is-debug; then
+		echo "$response"
+	else
+		echo "$response" | split-json "}}," "{" | per-line "json-property name"
+	fi
+}
+
+actions=$actions" get-repo"
+function get-repo() {
+	syntax-help 2 "user/org-name repo-name [property]" "$@"
+
+	check-user-org-exists-not "$1"; return-exit-code-if-error
+
+	response=$(github-curl GET /repos/"$1"/"$2")
+
+	if [ -z "$response" ]; then
+		echo-error Repository \`"$1"/"$2"\` does NOT exist
+		return 1
+	elif ! [[ 3 -le "$#" ]] || is-debug; then
+		output="$response"
+	else
+		output=$(echo "$response" | json-property "$3")
+	fi
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+actions=$actions" delete-repo"
+function delete-repo() {
+	syntax-help 2 "user/org-name repo-name" "$@"
+
+	check-user-org-exists-not "$1"; return-exit-code-if-error
+	check-repo-exists-not "$1" "$2"; return-if-error
+
+	output=$(github-curl DELETE /repos/"$1"/"$2")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" -"
+
+# actions=$actions" add-collaborator"
+function add-collaborator() {
+	syntax-help 3 "user/org-name repo-name user-name [permission:read/write/admin]" "$@"
+
+	check-user-org-exists-not "$1"; return-exit-code-if-error
+	check-repo-exists-not "$1" "$2"; return-exit-code-if-error
+	check-user-exists-not "$3"; return-exit-code-if-error
+
+	output=$(github-curl PUT /repos/"$1"/"$2"/collaborators/"$3" "{\"permission\":\"$4\"}")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+# actions=$actions" list-collaborators"
+function list-collaborators() {
+	syntax-help 2 "user/org-name repo-name" "$@"
+
+	get-collaborators "$1" "$2" username
+}
+
+# actions=$actions" get-collaborators"
+function get-collaborators() {
+	syntax-help 2 "user/org-name repo-name [property]" "$@"
+
+	check-user-org-exists-not "$1"; return-exit-code-if-error
+	check-repo-exists-not "$1" "$2"; return-exit-code-if-error
+
+	response=$(github-curl GET /repos/"$1"/"$2"/collaborators)
+
+	if ! [[ 3 -le "$#" ]] || is-debug; then
+		output="$response"
+	else
+		output=$(echo "$response" | split-json "}," "{" | per-line "json-property $3")
+	fi
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+# actions=$actions" remove-collaborator"
+function remove-collaborator() {
+	syntax-help 3 "user/org-name repo-name user-name" "$@"
+
+	check-user-org-exists-not "$1"; return-exit-code-if-error
+	check-repo-exists-not "$1" "$2"; return-exit-code-if-error
+	check-user-exists-not "$3"; return-if-error
+
+	output=$(github-curl DELETE /repos/"$1"/"$2"/collaborators/"$3")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" -"
+
+# actions=$actions" (admin) create-team"
+function create-team() {
+	syntax-help 3 "org-name team-name description [permission:read/write/admin]" "$@"
+
+	check-org-exists-not "$1"; return-exit-code-if-error
+	check-team-exists "$1" "$2"; return-if-error
+
+	output=$(github-curl POST /admin/orgs/"$1"/teams "{\"name\":\"$2\",\"description\":\"$3\",\"permission\":\"$4\"}")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+# actions=$actions" list-teams"
+function list-teams() {
+	syntax-help 1 "org-name" "$@"
+
+	get-teams "$1" name
+}
+
+# actions=$actions" get-teams"
+function get-teams() {
+	syntax-help 1 "org-name [property]" "$@"
+
+	check-org-exists-not "$1"; return-exit-code-if-error
+
+	response=$(github-curl GET /orgs/"$1"/teams)
+
+	if ! [[ 2 -le "$#" ]] || is-debug; then
+		output="$response"
+	else
+		output=$(echo "$response" | split-json "}," "{" | per-line "json-property $2")
+	fi
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+# actions=$actions" get-team"
+function get-team() {
+	syntax-help 2 "org-name team-name [property]" "$@"
+
+	sub-cmd-no-debug get-teams
+	response=$(get-teams "$1")
+	sub-cmd-error-check
+
+	response=$(echo "$response" | split-json "}," "{" | grep "\"name\":\"$2\"")
+
+	if [ -z "$response" ]; then
+		echo-error Team \`"$1":"$2"\` does NOT exist
+		return 1
+	elif ! [[ 3 -le "$#" ]] || is-debug; then
+		output="$response"
+	else
+		output=$(echo "$response" | json-property "$3")
+	fi
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+actions=$actions" -"
+
+# actions=$actions" (admin) add-team-member"
+function add-team-member() {
+	syntax-help 2 "(org-name team-name | team-id) user-name" "$@"
+
+	resolve-team-id-and-following-name "$@"; return-exit-code-if-error
+
+	check-user-exists-not "$name"; return-exit-code-if-error
+
+	output=$(github-curl PUT /admin/teams/"$id"/members/"$name")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+# actions=$actions" (admin) list-team-members"
+function list-team-members() {
+	syntax-help 1 "org-name team-name | team-id" "$@"
+
+	resolve-team-id-and-following-name "$@" _; return-exit-code-if-error
+
+	get-team-members "$1" "$2" username
+}
+
+# actions=$actions" (admin) get-team-members"
+function get-team-members() {
+	syntax-help 1 "(org-name team-name | team-id) [property]" "$@"
+
+	resolve-team-id-and-following-name "$@" _; return-exit-code-if-error
+
+	response=$(github-curl GET /admin/teams/"$id"/members)
+
+	if [ "$name" = "_" ] || is-debug; then
+		echo "$response"
+	else
+		echo "$response" | split-json "}," "{" | per-line "json-property $name"
+	fi
+}
+
+# actions=$actions" (admin) remove-team-member"
+function remove-team-member() {
+	syntax-help 2 "(org-name team-name | team-id) user-name" "$@"
+
+	resolve-team-id-and-following-name "$@"; return-exit-code-if-error
+
+	output=$(github-curl DELETE /admin/teams/"$id"/members/"$name")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" -"
+
+# actions=$actions" (admin) add-team-repo"
+function add-team-repo() {
+	syntax-help 2 "(org-name team-name | team-id) repo-name" "$@"
+
+	resolve-team-id-and-following-name "$@"; return-exit-code-if-error
+
+	output=$(github-curl PUT /admin/teams/"$id"/repos/"$name")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+# actions=$actions" (admin) remove-team-repo"
+function remove-team-repo() {
+	syntax-help 2 "(org-name team-name | team-id) repo-name" "$@"
+
+	resolve-team-id-and-following-name "$@"; return-exit-code-if-error
+
+	output=$(github-curl DELETE /admin/teams/"$id"/repos/"$name")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" -"
+
+# actions=$actions" get-commit"
+function get-commit() {
+	syntax-help 3 "user/org-name repo-name branch/tag/sha [property]" "$@"
+
+	json=$(github-curl GET /repos/"$1"/"$2"/commits/"$3")
+
+	if ! [[ 4 -le "$#" ]] || is-debug; then
+		output="$json"
+	else
+		output=$(echo "$json" | json-property "$4")
+	fi
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+# actions=$actions" get-raw"
+function get-raw() {
+	syntax-help 3 "user/org-name repo-name ref" "$@"
+
+	output=$(github-curl GET /repos/"$1"/"$2"/raw/"$3")
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+# actions=$actions" enable-issues"
+function enable-issues() {
+	syntax-help 3 "user/org-name repo-name enable:true/false" "$@"
+
+	check-user-org-exists-not "$1"; return-exit-code-if-error
+	check-repo-exists-not "$1" "$2"; return-exit-code-if-error
+
+	output=$(github-curl PATCH /repos/"$1"/"$2"/issue-tracker "{\"enable_issues\":$3}")
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+# cmd interface ----------
+
+function print-help() {
+	echo
+	echo "  Syntax: github [OPTIONS] ACTION [ARGUMENTS ...]"
+	echo
+	echo "  "----------
+	echo "  "OPTIONS
+	echo
+	echo "  -h | --help            Print help of the action"
+	echo "  -d | --dry-run         See what commands will be executed, but \do nothing"
+	echo "  -D | --debug debug=1   Enable debug output"
+	echo "  -n | --no-checks       Disable sanity checks, e.g. \if an affected org/user/repo exists"
+	echo
+	echo "  "----------
+	echo "  "ACTIONS
+	echo
+	for action in $actions; do
+		info=
+		if [ "$action" = "-" ]; then
+			echo
+		elif [[ "$action" = "("* ]]; then
+			info="$action"
+		else
+			echo -en "  ""$action"
+			echo-hint " ""$info"
+			info=""
+		fi
+	done
+	configure do-not-ask-if-not-configured
+	echo
+	echo "  "----------
+	echo "  "CURRENT CONFIGURATION
+	echo
+	echo -e "  User: $(if [ -z "$github_user" ]; then echo-warning NOT-CONFIGURED; fi)$github_user"
+	echo$(if [ ! -z "$github_user" ]; then echo "-hint"; fi)\
+			"  (Change via environment variable $github_user_envvar or $github_user_filename)"
+	echo
+	echo -e "  Server: $(if [ -z "$github_server" ]; then echo-warning NOT-CONFIGURED; fi)$github_server"
+	echo$(if [ ! -z "$github_server" ]; then echo "-hint"; fi)\
+			"  (Change via environment variable $github_server_envvar or $github_server_filename)"
+	echo
+	echo -e "  API token: $(if [ -z "$github_token" ]; then echo-warning NOT-CONFIGURED; else echo "${github_token:0:5}"...; fi)"
+	echo$(if [ ! -z "$github_server" ]; then echo "-hint"; fi)\
+			"  (Change via environment variable $github_token_envvar or $github_token_filename[.gpg])\n"\
+			 " (Create one via \`create-api-token\` or"\
+					"at $(if [ -z "$github_server" ]; then echo https://YOUR.GITHUB.SERVER; fi)$github_server/settings/tokens)"
+
+	if [ ! -z "$github_server" ] && [ ! -z "$github_token" ]; then
+		echo
+		echo "  Authenticated as:"
+		echo -n "  ... "
+		response=$(get-api-token-user)
+		r_login=$(echo "$response" | json-property username)
+		r_name=$(echo "$response" | json-property full_name)
+		r_email=$(echo "$response" | json-property email)
+		echo -en "\r  $r_login"
+		if [ ! -z "$r_name" ]; then echo -n " ($r_name)"; fi
+		echo " / $r_email"
+	fi
+}
+
+help=
+dry_run=
+debug=0
+no_checks=
+while [ 0 -lt "$#" ] && [[ "$1" = "-"* ]] && [ "$1" != "--" ]; do
+	case "$1" in
+		-h | --help) help=true ;;
+		-d | --dry-run) dry_run=true; debug=1; echo \# DRY RUN \(doing nothing\) ;;
+		-D | --debug) debug=1; echo \# DEV RUN ;;
+		-n | --no-checks) no_checks=true ;;
+	esac
+	shift
+done
+if [ -n "$no_checks" ] && is-debug; then
+	 echo \# SKIP SANITY CHECKS
+fi
+
+function run_action() {
+	action=$1
+	[ -n "$help" ] || configure
+	if is-debug; then
+		echo -e "# Config:\tURL: $github_server"
+		echo -e "#\t\tToken: $github_token"
+		echo \#
+		echo \# Action: "$action"
+	fi
+	"$@"
+}
+
+if [ $# -gt 0 ]; then
+	action=$1
+	shift
+	for a in $actions; do
+		if [ "$a" = "$action" ] && [ "$a" != "-" ]; then
+			run_action "$action" "$@"
+			exit $?
+		fi
+	done
+	case $action in
+		--)
+			action=$1
+			shift
+			run_action "$action" "$@"
+			;;
+		*)
+			echo-error Unrecognized action: \`"$action"\`
+			exit 1
+			;;
+	esac
+else
+	print-help
+fi
